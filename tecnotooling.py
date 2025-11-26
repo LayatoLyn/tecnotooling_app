@@ -4,9 +4,21 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import io
+
+def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Return a bytes object with the dataframe saved as an Excel (.xlsx) file."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Registros")
+    return output.getvalue()
 
 st.set_page_config(page_title="Registro de Serviços", page_icon="📋", layout="wide")
-DB_PATH = (st.secrets.get("DB_PATH")
+try:
+    db_secret = st.secrets.get("DB_PATH")
+except Exception:
+    db_secret = None
+DB_PATH = (db_secret
            or os.getenv("DB_PATH")
            or "tecnotooling.db")
 
@@ -39,6 +51,19 @@ class DB:
             FOREIGN KEY(servico_id) REFERENCES servicos(id),
             FOREIGN KEY(setor_id) REFERENCES setores(id)
         )""")
+        # Ensure 'etapa' column exists (for upgrades of existing DBs)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(registros)").fetchall()]
+        if "etapa" not in cols:
+            try:
+                c.execute("ALTER TABLE registros ADD COLUMN etapa TEXT")
+            except Exception:
+                # ignore if cannot alter
+                pass
+        c.execute('''CREATE TABLE IF NOT EXISTS logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            carimbo TEXT NOT NULL,
+            message TEXT NOT NULL
+        )''')
         c.commit()
         c.close()
     def all(self, table):
@@ -60,8 +85,8 @@ class DB:
         try:
             c.execute(
                 """INSERT INTO registros
-                (carimbo, solicitante, cliente_id, servico_id, quantidade, valor_unidade, setor_id, forma_pagamento, observacoes)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (carimbo, solicitante, cliente_id, servico_id, quantidade, valor_unidade, setor_id, forma_pagamento, observacoes, etapa)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     dados["carimbo"],
                     dados["solicitante"],
@@ -72,16 +97,63 @@ class DB:
                     dados["setor_id"],
                     dados["forma_pagamento"],
                     dados["observacoes"],
+                    dados.get("etapa"),
                 ),
             )
             c.commit()
+            # Get last inserted id and log the insertion
+            last_id = c.execute('SELECT last_insert_rowid() as id').fetchone()[0]
+            try:
+                cliente = c.execute('SELECT nome FROM clientes WHERE id=?', (dados['cliente_id'],)).fetchone()
+                servico = c.execute('SELECT nome FROM servicos WHERE id=?', (dados['servico_id'],)).fetchone()
+                cliente_nome = cliente['nome'] if cliente else str(dados['cliente_id'])
+                servico_nome = servico['nome'] if servico else str(dados['servico_id'])
+            except Exception:
+                cliente_nome = str(dados['cliente_id'])
+                servico_nome = str(dados['servico_id'])
+            carimbo_log = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute('INSERT INTO logs(carimbo,message) VALUES(?,?)', (carimbo_log, f"Registro {last_id} criado por {dados.get('solicitante')} - {cliente_nome} - {servico_nome} - etapa: {dados.get('etapa') or '(Sem etapa)'}"))
+            c.commit()
         finally:
             c.close()
-    def query_registros(self, dt_ini=None, dt_fim=None, cliente_id=None, servico_id=None, setor_id=None, forma=None):
+
+    def update_registro_etapa(self, registro_id: int, etapa: str):
+        c = self._conn()
+        try:
+            # read previous etapa
+            row = c.execute('SELECT etapa FROM registros WHERE id=?', (registro_id,)).fetchone()
+            prev = row['etapa'] if row else None
+            cur = c.execute("UPDATE registros SET etapa=? WHERE id=?", (etapa, int(registro_id)))
+            c.commit()
+            # log the change
+            carimbo_log = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute('INSERT INTO logs(carimbo,message) VALUES(?,?)', (carimbo_log, f"Registro {registro_id}: etapa alterada de {prev or '(Sem etapa)'} para {etapa}"))
+            c.commit()
+            return cur.rowcount
+        finally:
+            c.close()
+
+    def add_log(self, message: str):
+        c = self._conn()
+        try:
+            carimbo_log = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute('INSERT INTO logs(carimbo,message) VALUES(?,?)', (carimbo_log, message))
+            c.commit()
+        finally:
+            c.close()
+
+    def get_logs(self, limit: int = 20):
+        c = self._conn()
+        try:
+            rows = c.execute('SELECT * FROM logs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+            return [dict(x) for x in rows]
+        finally:
+            c.close()
+    def query_registros(self, dt_ini=None, dt_fim=None, cliente_id=None, servico_id=None, setor_id=None, forma=None, etapa=None):
         base = """SELECT r.id, r.carimbo, r.solicitante,
                   c.nome AS cliente, s.nome AS servico, r.quantidade, r.valor_unidade,
                   (r.quantidade*r.valor_unidade) AS valor_total,
-                  st.nome AS setor, r.forma_pagamento, r.observacoes, r.setor_id, r.cliente_id, r.servico_id
+              st.nome AS setor, r.forma_pagamento, r.observacoes, r.etapa AS etapa, r.setor_id, r.cliente_id, r.servico_id
                   FROM registros r
                   JOIN clientes c ON c.id=r.cliente_id
                   JOIN servicos s ON s.id=r.servico_id
@@ -106,6 +178,9 @@ class DB:
         if forma:
             base += " AND ifnull(r.forma_pagamento,'')=?"
             params.append(forma)
+        if etapa:
+            base += " AND ifnull(r.etapa,'')=?"
+            params.append(etapa)
         base += " ORDER BY datetime(r.carimbo) DESC"
         c = self._conn()
         r = c.execute(base, tuple(params)).fetchall()
@@ -113,6 +188,18 @@ class DB:
         return [dict(x) for x in r]
 
 db = DB(DB_PATH)
+
+# Etapas options
+ETAPAS = [
+    "",
+    "Negociação",
+    "Validação do pedido",
+    "Emissão NF",
+    "Pronto para entrega",
+    "A caminho",
+    "Entregue",
+    "Concluído",
+]
 
 if "view" not in st.session_state:
     st.session_state.view = "form"
@@ -178,7 +265,9 @@ if st.session_state.view == "form":
             setor_id = next((s["id"] for s in setores if s["nome"] == setor_sel), None)
         forma = st.selectbox("Forma de pagamento", ["", "Dinheiro", "Cartão", "PIX", "Boleto", "Transferência"])
         obs = st.text_area("Observações", height=110)
-        carimbo_manual = st.toggle("Definir data/hora manual")
+        etapa = st.selectbox("Etapa", ETAPAS, index=0)
+        # st.toggle might not exist in older Streamlit versions; use checkbox instead
+        carimbo_manual = st.checkbox("Definir data/hora manual")
         if carimbo_manual:
             data_str = st.text_input("AAAA-MM-DD HH:MM:SS", value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             carimbo = data_str
@@ -201,6 +290,7 @@ if st.session_state.view == "form":
                     "setor_id": setor_id if setor_id else None,
                     "forma_pagamento": forma if forma else None,
                     "observacoes": obs.strip() if obs else None,
+                    "etapa": etapa if etapa else None,
                 }
             )
             st.success("Registro salvo")
@@ -223,16 +313,58 @@ if st.session_state.view == "form":
         dt_ini = st.text_input("Início (AAAA-MM-DD)", value="")
     with f_d:
         dt_fim = st.text_input("Fim (AAAA-MM-DD)", value="")
+        f_et = st.selectbox("Filtro etapa", ["Todos"] + [e for e in ETAPAS if e])
+        f_et_val = None if f_et == "Todos" else f_et
     dt_ini_q = f"{dt_ini.strip()} 00:00:00" if dt_ini.strip() else None
     dt_fim_q = f"{dt_fim.strip()} 23:59:59" if dt_fim.strip() else None
-    dados = db.query_registros(dt_ini_q, dt_fim_q, f_cli_id, f_sv_id)
+    dados = db.query_registros(dt_ini_q, dt_fim_q, f_cli_id, f_sv_id, None, None, f_et_val)
     if dados:
         df = pd.DataFrame(dados)
+        # copy for export before formatting for display
+        df_export = df.copy()
         df["carimbo"] = pd.to_datetime(df["carimbo"]).dt.strftime("%d/%m/%Y %H:%M")
         df["valor_unidade"] = df["valor_unidade"].map(lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         df["valor_total"] = df["valor_total"].map(lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        cols = ["carimbo","solicitante","cliente","servico","quantidade","valor_unidade","valor_total","setor","forma_pagamento","observacoes"]
+        cols = ["carimbo","solicitante","cliente","servico","quantidade","valor_unidade","valor_total","setor","forma_pagamento","etapa","observacoes"]
+        # Export button placed above the table
+        with st.container():
+            st.download_button(
+                label="Exportar",
+                data=_to_excel_bytes(df_export[cols]),
+                file_name=f"registros_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        st.markdown("---")
+        st.subheader("Log de alterações")
+        logs = db.get_logs(10)
+        if logs:
+            for l in logs:
+                st.write(f"{l['carimbo']} — {l['message']}")
+        else:
+            st.write("Sem alterações registradas")
+        st.markdown("---")
+        st.subheader("Alterar etapa de um registro")
+        reg_options = [f"{r['id']} - {r['carimbo']} - {r['cliente']} - {r['servico']} - {r.get('etapa') or '(Sem etapa)'}" for r in dados]
+        if reg_options:
+            sel_reg = st.selectbox("Selecione registro", reg_options)
+            # robust parse of id from selection
+            sel_id = None
+            try:
+                sel_id = int(str(sel_reg).split(" - ")[0])
+            except Exception:
+                sel_id = None
+            new_etapa = st.selectbox("Nova etapa", [e for e in ETAPAS if e])
+            if st.button("Atualizar etapa", key="update_etapa_form"):
+                if sel_id is None:
+                    st.error("Não foi possível determinar o ID do registro selecionado")
+                else:
+                    updated = db.update_registro_etapa(sel_id, new_etapa)
+                    if updated:
+                        st.success("Etapa atualizada")
+                    else:
+                        st.error("Falha ao atualizar etapa")
+                    st.rerun()
     else:
         st.info("Sem registros")
 
@@ -253,6 +385,8 @@ else:
     with colf4:
         f_fp = st.selectbox("Pagamento", ["Todos", "Dinheiro", "Cartão", "PIX", "Boleto", "Transferência"])
         f_fp_val = None if f_fp == "Todos" else f_fp
+        f_et = st.selectbox("Etapa", ["Todos"] + [e for e in ETAPAS if e])
+        f_et_val = None if f_et == "Todos" else f_et
     with colf5:
         dt_range = st.text_input("Período AAAA-MM-DD|AAAA-MM-DD", value="")
     if dt_range and "|" in dt_range:
@@ -262,11 +396,12 @@ else:
     else:
         dt_ini_q = None
         dt_fim_q = None
-    dados = db.query_registros(dt_ini_q, dt_fim_q, f_cli_id, f_sv_id, f_st_id, f_fp_val)
+    dados = db.query_registros(dt_ini_q, dt_fim_q, f_cli_id, f_sv_id, f_st_id, f_fp_val, f_et_val)
     if not dados:
         st.info("Sem dados para os filtros")
     else:
         df = pd.DataFrame(dados)
+        df_export = df.copy()
         df["carimbo_dt"] = pd.to_datetime(df["carimbo"])
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         with kpi1:
@@ -303,3 +438,52 @@ else:
         g4 = df.groupby(["cliente"], dropna=False)["valor_total"].sum().reset_index().sort_values("valor_total", ascending=False).head(10)
         fig5 = px.bar(g4, x="cliente", y="valor_total", title="Top clientes por valor")
         st.plotly_chart(fig5, use_container_width=True)
+        # end of dashboard area
+        st.markdown("---")
+        st.subheader("Log de alterações")
+        logs = db.get_logs(10)
+        if logs:
+            for l in logs:
+                st.write(f"{l['carimbo']} — {l['message']}")
+        else:
+            st.write("Sem alterações registradas")
+        # Export button for dashboard table
+        with st.container():
+            st.download_button(
+                label="Exportar",
+                data=_to_excel_bytes(df_export[["carimbo","solicitante","cliente","servico","quantidade","valor_unidade","valor_total","setor","forma_pagamento","etapa","observacoes"]]),
+                file_name=f"registros_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        # Allow editing etapa from dashboard as well
+        st.markdown("---")
+        st.subheader("Alterar etapa de um registro")
+        reg_options = [f"{r['id']} - {r['carimbo']} - {r['cliente']} - {r['servico']} - {r.get('etapa') or '(Sem etapa)'}" for r in dados]
+        if reg_options:
+            sel_reg = st.selectbox("Selecione registro", reg_options)
+            sel_id = None
+            try:
+                sel_id = int(str(sel_reg).split(" - ")[0])
+            except Exception:
+                sel_id = None
+            new_etapa = st.selectbox("Nova etapa", [e for e in ETAPAS if e])
+            if st.button("Atualizar etapa", key="update_etapa_dash"):
+                if sel_id is None:
+                    st.error("Não foi possível determinar o ID do registro selecionado")
+                else:
+                    updated = db.update_registro_etapa(sel_id, new_etapa)
+                    if updated:
+                        st.success("Etapa atualizada")
+                    else:
+                        st.error("Falha ao atualizar etapa")
+                    st.experimental_rerun()
+            # show a small change log box
+            st.markdown("---")
+            st.subheader("Log de alterações")
+            logs = db.get_logs(10)
+            if logs:
+                for l in logs:
+                    # Show timestamp and message
+                    st.write(f"{l['carimbo']} — {l['message']}")
+            else:
+                st.write("Sem alterações registradas")
